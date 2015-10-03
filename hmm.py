@@ -288,7 +288,7 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
             for p in xrange(counts.shape[0]):
                 for w in xrange(counts.shape[1]):
                     v += math.exp(sum(weights[f] for f in feat_map[p, w]))
-            result -= val
+            result -= v
 
         return result
 
