@@ -366,7 +366,7 @@ for arg in sys.argv[1:]:
                    vote_across_langs, l1_exp_reg_coeff) = \
 (float(args['reg_coeff']), float(args['shared_reg_coeff']), int(args['iterations']),
                float(args['init_noise_level']), int(args['repeat']),
-               args['out_file'], args['sources'].split(',') if 'sources' in args else None, args['target'],
+               args['out_file'] if 'out_file' in args else None, args['sources'].split(',') if 'sources' in args else None, args['target'],
                args['do_freq_features'] == 'True', args['vote_across_langs'] == 'True', float(args['l1_exp_reg_coeff']))
 
 print 'regularization coeff', base_reg_coeff
@@ -453,10 +453,12 @@ def run(prev_trans_weights, prev_em_weights, name):
     iteration_result = []
     viterbi_log_prob = 0
     word_pos_counts = numpy.zeros((len(words), n_pos))
+    text_result_iter = []
     for sentence, sent_pos in zip(sentences, sentences_pos):
         pred_pos, pred_prob_log = viterbi(sentence, trans_probs, em_probs, start_token)
         viterbi_log_prob += pred_prob_log
         iteration_result.append(pred_pos)
+        text_result_iter.append([(words[w], pos_tags[p]) for w, p in zip(sentence, pred_pos)])
         # print [(words[w], pos[p]) for w, p in zip(sentence, pred_pos)]
         # print pred_prob_log
         for pred, gold, word in zip(pred_pos, sent_pos, sentence):
@@ -469,6 +471,9 @@ def run(prev_trans_weights, prev_em_weights, name):
 
     word_pos_counts /= (word_pos_counts.sum(axis=1).reshape((len(words), 1)))
     print 'word counts', universal_pos_tags, word_pos_counts.sum(axis=0)
+
+    if out_file is not None:
+        load_and_save.write_sentences_to_file(text_result_iter, out_file + '-' + name)
 
     return iteration_result
 
@@ -490,9 +495,9 @@ for repeat_number in xrange(repeat):
 
     initializations.append((prev_trans_weights, prev_em_weights, name))
 
-# num_cores = multiprocessing.cpu_count()
-# results = Parallel(n_jobs=num_cores/2)(delayed(run)(pt, pe, n) for pt, pe, n in initializations)
-results = [run(pt, pe, n) for pt, pe, n in initializations]
+num_cores = multiprocessing.cpu_count()
+results = Parallel(n_jobs=num_cores/2)(delayed(run)(pt, pe, n) for pt, pe, n in initializations)
+# results = [run(pt, pe, n) for pt, pe, n in initializations]
 
 # vote on final output over different initializations
 pred_sent_pos = []
@@ -518,4 +523,5 @@ for s, sent_pos in enumerate(sentences_pos):
 print 'score', correct / float(total)
 # print confusion_matrix
 print 'many to one', confusion_matrix.max(axis=1).sum() / float(confusion_matrix.sum())
-load_and_save.write_sentences_to_file(out_text_sents, out_file)
+if out_file is not None:
+    load_and_save.write_sentences_to_file(out_text_sents, out_file)
