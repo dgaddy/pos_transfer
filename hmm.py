@@ -50,6 +50,8 @@ def add_counts_forward_backward(sentence_int, trans_probs, emission_probs, start
     backward_lattice = numpy.zeros((len_sent, n_pos))
 
     backward_lattice[len_sent-1, :] = trans_probs[:, start_token] # probability of transitioning to end token
+    norm = (forward_lattice[len_sent-1] * backward_lattice[len_sent-1]).sum()
+    backward_lattice[len_sent-1, :] /= norm
     # without end token, would be numpy.ones((1, n_pos))
     for i in reversed(xrange(len_sent-1)):
         for j in xrange(n_pos):
