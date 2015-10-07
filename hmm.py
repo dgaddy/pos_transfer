@@ -156,6 +156,9 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
                       update_transitions, direct_gradient,
                       l2_weight_regularization, l1_unnorm_regularization, l1_regularization_by_tag):
 
+    norm_l = .1
+    log_source_tag_probs = numpy.log(source_tag_probs + 1e-8)
+
     def loss_trans(weights):
         weights = weights.reshape(trans_counts.shape)  # because optimize flattens them
         p = probs_from_weights(weights)
@@ -184,7 +187,11 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
 
         result += (weights * weights).sum() * l2_weight_regularization
 
-        result += numpy.exp(weights).sum() * l1_unnorm_regularization
+        result += numpy.exp(weights * norm_l).sum() * l1_unnorm_regularization
+
+        exponentials = numpy.exp(weights)
+        sum_exp_over_tags = exponentials.sum(axis=0)
+        result -= (log_source_tag_probs[:, numpy.newaxis] * (exponentials / sum_exp_over_tags[numpy.newaxis, :])).sum() * l1_regularization_by_tag
 
         return result
 
@@ -196,7 +203,14 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
 
         result += 2 * l2_weight_regularization * weights
 
-        result += numpy.exp(weights) * l1_unnorm_regularization
+        result += numpy.exp(weights * norm_l) * (l1_unnorm_regularization * norm_l)
+
+        exponentials = numpy.exp(weights)
+        sum_exp_over_tags = exponentials.sum(axis=0)
+        exp_times_log_tag = log_source_tag_probs[:, numpy.newaxis] * exponentials
+        term1 = exp_times_log_tag * sum_exp_over_tags[numpy.newaxis, :]
+        term3 = exp_times_log_tag.sum(axis=0)[numpy.newaxis, :] * exponentials
+        result -= (term1 - term3) / (sum_exp_over_tags * sum_exp_over_tags)[numpy.newaxis, :] * l1_regularization_by_tag
 
         return result.ravel()
 
@@ -265,6 +279,7 @@ print 'output file', out_file
 print 'update transitions', update_transitions
 print 'l2 weight regularization', l2_weight_regulariztion_coeff
 print 'l1 exp regularization', l1_exp_regularization_coeff
+print 'l1 tag normalized regularization', l1_tag_regularization_coeff
 print 'direct gradient', direct_gradient
 
 pos_tags = universal_pos_tags
@@ -332,7 +347,7 @@ def run(initial_lg_transition, initial_lg_emission, source_transition, source_ta
     print name, 'viterbi log prob:', viterbi_log_prob
 
     word_pos_indicator = (word_pos_counts > 0)
-    print 'average number of pos per word', word_pos_indicator.sum() / n_words
+    print 'average number of pos per word', word_pos_indicator.sum() / float(n_words)
     word_pos_counts /= word_pos_counts.sum(axis=1)[:, numpy.newaxis]
     print 'word counts', universal_pos_tags, word_pos_counts.sum(axis=0)
 
