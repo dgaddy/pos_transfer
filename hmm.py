@@ -290,7 +290,7 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
             for p in xrange(counts.shape[0]):
                 for w in xrange(counts.shape[1]):
                     v += math.exp(sum(weights[f] for f in feat_map[p, w]))
-            result -= v
+            result -= v * l1_reg_coeff
 
         return result
 
@@ -317,7 +317,7 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
                 for w in xrange(counts.shape[1]):
                     e = math.exp(sum(weights[f] for f in feat_map[p, w]))
                     for f in feat_map[p, w]:
-                        result[f] -= e
+                        result[f] -= e * l1_reg_coeff
 
         return result
 
@@ -497,8 +497,8 @@ for repeat_number in xrange(repeat):
 
     initializations.append((prev_trans_weights, prev_em_weights, name))
 
-num_cores = multiprocessing.cpu_count()
-results = Parallel(n_jobs=num_cores/2)(delayed(run)(pt, pe, n) for pt, pe, n in initializations)
+num_cores = min(len(initializations), max(multiprocessing.cpu_count() / 2, 1))
+results = Parallel(n_jobs=num_cores)(delayed(run)(pt, pe, n) for pt, pe, n in initializations)
 # results = [run(pt, pe, n) for pt, pe, n in initializations]
 
 # vote on final output over different initializations
