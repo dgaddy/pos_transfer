@@ -115,6 +115,7 @@ def viterbi(sentence_int, trans_probs, emission_probs, start_token):
 def get_shared_model(languages, pos_tags):
     start_token = pos_tags.index('START')
     transitions = []
+    tag_distributions = []
     for l, language in enumerate(languages):
         text_sentences = load_and_save.read_sentences_from_file('pos_data/'+language+'.pos')
 
@@ -122,11 +123,13 @@ def get_shared_model(languages, pos_tags):
         n_pos = len(pos_tags)
 
         trans_counts = numpy.zeros((n_pos, n_pos))
+        word_pos = numpy.zeros((n_pos, 1000))
 
         for sent, sent_pos in zip(sentences, sentences_pos):
             for i in xrange(len(sent)):
                 w = sent[i]
                 p = sent_pos[i]
+                word_pos[p, w] = 1
                 if i == 0:
                     trans_counts[start_token, p] += 1
                 else:
@@ -137,7 +140,11 @@ def get_shared_model(languages, pos_tags):
         trans_probs = trans_counts / trans_counts.sum(axis=1)[:, numpy.newaxis]
         transitions.append(trans_probs)
 
-    return transitions
+        tag_counts = word_pos.sum(axis=1)
+        tag_probs = tag_counts / tag_counts.sum()
+        tag_distributions.append(tag_probs)
+
+    return transitions, tag_distributions
 
 def probs_from_weights(weights):
     # TODO: do we want to offset weights before exp for numerical reasons?
@@ -145,7 +152,9 @@ def probs_from_weights(weights):
     exp_weights = numpy.exp(weights)
     return exp_weights / exp_weights.sum(axis=1)[:, numpy.newaxis]
 
-def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_trans_probs, update_transitions):
+def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_trans_probs, source_tag_probs,
+                      update_transitions,
+                      l2_weight_regularization, l1_unnorm_regularization, l1_regularization_by_tag):
 
     def loss_trans(weights):
         weights = weights.reshape(trans_counts.shape)  # because optimize flattens them
@@ -173,7 +182,9 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
         log_p = numpy.log(p)
         result = -((em_counts * log_p).sum())
 
-        # TODO regularization
+        result += (weights * weights).sum() * l2_weight_regularization
+
+        result += numpy.exp(weights).sum() * l1_unnorm_regularization
 
         return result
 
@@ -183,7 +194,9 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
         pos_counts = em_counts.sum(axis=1)
         result = (p * pos_counts[:, numpy.newaxis]) - em_counts
 
-        # TODO regularization
+        result += 2 * l2_weight_regularization * weights
+
+        result += numpy.exp(weights) * l1_unnorm_regularization
 
         return result.ravel()
 
@@ -225,7 +238,8 @@ def model_from_counts(transition_counts, emission_counts):
     return transition_probs, emission_probs
 
 
-default_args = {'reg_coeff': 1e-4, 'iterations': 20, 'init_noise_level': 0, 'repeat': 1, 'update_transitions': 'True'}
+default_args = {'reg_coeff': 0, 'iterations': 20, 'init_noise_level': 0, 'repeat': 1, 'update_transitions': 'False',
+                'l1_exp_coeff': 0, 'l1_tag_coeff': 0}
 
 args = default_args.copy()
 for arg in sys.argv[1:]:
@@ -234,16 +248,19 @@ for arg in sys.argv[1:]:
     val = arg[i+1:]
     args[key] = val
 
-(iterations, initialization_noise_level, repeat, out_file, source, target, update_transitions) = \
+(iterations, initialization_noise_level, repeat, out_file, source, target, update_transitions,
+ l2_weight_regulariztion_coeff, l1_exp_regularization_coeff, l1_tag_regularization_coeff) = \
 (int(args['iterations']), float(args['init_noise_level']), int(args['repeat']),
                args['out_file'] if 'out_file' in args else None, args['sources'].split(',') if 'sources' in args else None, args['target'],
-               args['update_transitions'] == 'True')
+               args['update_transitions'] == 'True', float(args['reg_coeff']), float(args['l1_exp_coeff']), float(args['l1_tag_coeff']))
 
 print 'iterations', iterations
 print 'initalization noise', initialization_noise_level
 print 'repeats', repeat
 print 'output file', out_file
 print 'update transitions', update_transitions
+print 'l2 weight regularization', l2_weight_regulariztion_coeff
+print 'l1 exp regularization', l1_exp_regularization_coeff
 
 pos_tags = universal_pos_tags
 
@@ -259,11 +276,11 @@ annotated_languages = source if source is not None else [l for l in WALS_map if 
 print 'from', annotated_languages
 num_shared_langs = len(annotated_languages)
 
-other_langs_trans_dists = get_shared_model(annotated_languages, pos_tags)
+other_langs_trans_dists, other_langs_tag_dists = get_shared_model(annotated_languages, pos_tags)
 
 print "finished loading source models"
 
-def run(initial_lg_transition, initial_lg_emission, source_transition, name):
+def run(initial_lg_transition, initial_lg_emission, source_transition, source_tag_distribution, name):
     prev_trans_weights = initial_lg_transition
     prev_em_weights = initial_lg_emission
     trans_probs = probs_from_weights(initial_lg_transition)
@@ -283,7 +300,9 @@ def run(initial_lg_transition, initial_lg_emission, source_transition, name):
         #trans_probs, em_probs = model_from_counts(trans_counts, em_counts, n_pos)
 
         trans_probs, em_probs, prev_trans_weights, prev_em_weights, result_description = \
-            optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_transition, update_transitions)
+            optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_transition, source_tag_distribution,
+                              update_transitions, l2_weight_regulariztion_coeff, l1_exp_regularization_coeff,
+                              l1_tag_regularization_coeff)
         print name, "iteration:", iter, result_description
 
     correct = 0
@@ -307,8 +326,11 @@ def run(initial_lg_transition, initial_lg_emission, source_transition, name):
     print name, correct / float(total)
     print name, 'viterbi log prob:', viterbi_log_prob
 
+    word_pos_indicator = (word_pos_counts > 0)
+    print 'average number of pos per word', word_pos_indicator.sum() / n_words
     word_pos_counts /= word_pos_counts.sum(axis=1)[:, numpy.newaxis]
     print 'word counts', universal_pos_tags, word_pos_counts.sum(axis=0)
+
 
     if out_file is not None:
         load_and_save.write_sentences_to_file(text_result_iter, out_file + '-' + name)
@@ -317,7 +339,7 @@ def run(initial_lg_transition, initial_lg_emission, source_transition, name):
 
 initializations = []
 for repeat_number in xrange(repeat):
-    for trans_dist, language_name in zip(other_langs_trans_dists, annotated_languages):
+    for trans_dist, tag_dist, language_name in zip(other_langs_trans_dists, other_langs_tag_dists, annotated_languages):
         initial_lg_trans = numpy.log(trans_dist)
         init_em = numpy.ones((n_pos, n_words))
 
@@ -347,10 +369,10 @@ for repeat_number in xrange(repeat):
             initial_lg_trans += numpy.random.normal(scale=initialization_noise_level, size=initial_lg_trans.shape)
             initial_lg_em += numpy.random.normal(scale=initialization_noise_level, size=initial_lg_em.shape)
 
-        initializations.append((initial_lg_trans, initial_lg_em, trans_dist, name))
+        initializations.append((initial_lg_trans, initial_lg_em, trans_dist, tag_dist, name))
 
 num_cores = min(len(initializations), max(multiprocessing.cpu_count() / 2, 1))
-results = Parallel(n_jobs=num_cores)(delayed(run)(ilt, ile, td, n) for ilt, ile, td, n in initializations)
+results = Parallel(n_jobs=num_cores)(delayed(run)(ilt, ile, tnsd, tgd, n) for ilt, ile, tnsd, tgd, n in initializations)
 # results = [run(ilt, ile, td, n) for pt, pe, n in initializations]
 
 # vote on final output over different initializations
