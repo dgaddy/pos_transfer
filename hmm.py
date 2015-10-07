@@ -27,15 +27,8 @@ def fill_forward_lattice(sentence_int, trans_probs, emission_probs, start_token)
             lattice[i, :] = trans_probs[start_token, :] * emission_probs[:, w]
             lattice[i, start_token] = 0
         else:
-            for j in xrange(n):
-                if j == start_token:
-                    continue
-
-                val = 0
-                for k in xrange(n):
-                    val += trans_probs[k, j] * lattice[i-1, k]
-                val *= emission_probs[j, w]
-                lattice[i, j] = val
+            lattice[i, :] = lattice[i-1, :][numpy.newaxis, :].dot(trans_probs).ravel() * emission_probs[:, w]
+            lattice[i, start_token] = 0
 
         scaling_factors[i] = 1.0 / normalize(lattice[i, :])
 
@@ -54,38 +47,24 @@ def add_counts_forward_backward(sentence_int, trans_probs, emission_probs, start
     backward_lattice[len_sent-1, :] /= norm
     # without end token, would be numpy.ones((1, n_pos))
     for i in reversed(xrange(len_sent-1)):
-        for j in xrange(n_pos):
-            if j == start_token:
-                continue
-
-            val = 0
-            for k in xrange(n_pos):
-                val += trans_probs[j, k] * backward_lattice[i+1, k] * emission_probs[k, sentence_int[i+1]]
-            val *= scaling_factors[i+1]
-            backward_lattice[i, j] = val
+        backward_lattice[i, :] = (trans_probs.dot((backward_lattice[i+1, :] * emission_probs[:, sentence_int[i+1]])[:, numpy.newaxis]) * scaling_factors[i+1]).ravel()
+        backward_lattice[i, start_token] = 0
 
     probs = forward_lattice * backward_lattice
 
     for i in xrange(len_sent):
         # emission counts
-        for j in xrange(n_pos):
-            em_counts[j, sentence_int[i]] += probs[i, j]
+        em_counts[:, sentence_int[i]] += probs[i, :]
         # transition counts
         if i == 0:
-            for j in xrange(n_pos):
-                trans_counts[start_token, j] += probs[i, j]
+            trans_counts[start_token, :] += probs[i, :]
         else:
-            m = numpy.zeros((n_pos, n_pos))
-            for j in xrange(n_pos):
-                for k in xrange(n_pos):
-                    m[j, k] = forward_lattice[i-1, j] * backward_lattice[i, k] * trans_probs[j, k] * emission_probs[k, sentence_int[i]]
+            m = forward_lattice[i-1, :][:, numpy.newaxis].dot((backward_lattice[i, :] * emission_probs[:, sentence_int[i]])[numpy.newaxis, :])
+            m *= trans_probs
             m /= m.sum()
-            for j in xrange(n_pos):
-                for k in xrange(n_pos):
-                    trans_counts[j, k] += m[j, k]
+            trans_counts += m
         if i == len_sent - 1:
-            for j in xrange(n_pos):
-                trans_counts[j, start_token] += probs[i, j]
+            trans_counts[:, start_token] += probs[i, :]
 
 
 def viterbi(sentence_int, trans_probs, emission_probs, start_token):
