@@ -153,7 +153,7 @@ def probs_from_weights(weights):
     return exp_weights / exp_weights.sum(axis=1)[:, numpy.newaxis]
 
 def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_trans_probs, source_tag_probs,
-                      update_transitions,
+                      update_transitions, direct_gradient,
                       l2_weight_regularization, l1_unnorm_regularization, l1_regularization_by_tag):
 
     def loss_trans(weights):
@@ -203,7 +203,8 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
     if update_transitions:
         if prev_trans_weights is None:
             prev_trans_weights = numpy.zeros(trans_counts.shape)
-        result = scipy.optimize.minimize(loss_trans, prev_trans_weights, method='L-BFGS-B', jac=d_loss_trans)
+        result = scipy.optimize.minimize(loss_trans, prev_trans_weights, method='L-BFGS-B', jac=d_loss_trans,
+                                         options=({'maxiter':1} if direct_gradient else {}))
         trans_weights = result.x.reshape(trans_counts.shape)
         trans_log_prob = result.fun
 
@@ -217,7 +218,8 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
 
     if prev_em_weights is None:
         prev_em_weights = numpy.zeros(em_counts.shape)
-    result = scipy.optimize.minimize(loss_em, prev_em_weights, method='L-BFGS-B', jac=d_loss_em)
+    result = scipy.optimize.minimize(loss_em, prev_em_weights, method='L-BFGS-B', jac=d_loss_em,
+                                     options=({'maxiter':1} if direct_gradient else {}))
     emission_weights = result.x.reshape(em_counts.shape)
     em_log_prob = result.fun
 
@@ -239,7 +241,7 @@ def model_from_counts(transition_counts, emission_counts):
 
 
 default_args = {'reg_coeff': 0, 'iterations': 20, 'init_noise_level': 0, 'repeat': 1, 'update_transitions': 'False',
-                'l1_exp_coeff': 0, 'l1_tag_coeff': 0}
+                'l1_exp_coeff': 0, 'l1_tag_coeff': 0, 'direct_gradient': 'False'}
 
 args = default_args.copy()
 for arg in sys.argv[1:]:
@@ -249,10 +251,12 @@ for arg in sys.argv[1:]:
     args[key] = val
 
 (iterations, initialization_noise_level, repeat, out_file, source, target, update_transitions,
- l2_weight_regulariztion_coeff, l1_exp_regularization_coeff, l1_tag_regularization_coeff) = \
+ l2_weight_regulariztion_coeff, l1_exp_regularization_coeff, l1_tag_regularization_coeff,
+ direct_gradient) = \
 (int(args['iterations']), float(args['init_noise_level']), int(args['repeat']),
                args['out_file'] if 'out_file' in args else None, args['sources'].split(',') if 'sources' in args else None, args['target'],
-               args['update_transitions'] == 'True', float(args['reg_coeff']), float(args['l1_exp_coeff']), float(args['l1_tag_coeff']))
+               args['update_transitions'] == 'True', float(args['reg_coeff']), float(args['l1_exp_coeff']), float(args['l1_tag_coeff']),
+               args['direct_gradient'] == 'True')
 
 print 'iterations', iterations
 print 'initalization noise', initialization_noise_level
@@ -261,6 +265,7 @@ print 'output file', out_file
 print 'update transitions', update_transitions
 print 'l2 weight regularization', l2_weight_regulariztion_coeff
 print 'l1 exp regularization', l1_exp_regularization_coeff
+print 'direct gradient', direct_gradient
 
 pos_tags = universal_pos_tags
 
@@ -301,8 +306,8 @@ def run(initial_lg_transition, initial_lg_emission, source_transition, source_ta
 
         trans_probs, em_probs, prev_trans_weights, prev_em_weights, result_description = \
             optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_transition, source_tag_distribution,
-                              update_transitions, l2_weight_regulariztion_coeff, l1_exp_regularization_coeff,
-                              l1_tag_regularization_coeff)
+                              update_transitions, direct_gradient,
+                              l2_weight_regulariztion_coeff, l1_exp_regularization_coeff, l1_tag_regularization_coeff)
         print name, "iteration:", iter, result_description
 
     correct = 0
