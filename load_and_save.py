@@ -69,14 +69,14 @@ def write_sentences_to_file(sentences, filename):
             f.write('\t')
         f.write('\n')
 
-def read_sentences_from_file(filename, exclude_pos = False):
+def read_sentences_from_file(filename, exclude_punc = False):
     f = open(filename, 'r')
     result = []
     for line in f:
         s = line.split('\t')
         words = [w for i, w in enumerate(s) if i % 2 == 0]
         pos = [w for i, w in enumerate(s) if i % 2 == 1]
-        sent = [(w, p) for w, p in zip(words, pos) if p != '.'] if exclude_pos else zip(words, pos)
+        sent = [(w, p) for w, p in zip(words, pos) if p != '.'] if exclude_punc else zip(words, pos)
         result.append(sent)
     return result
 

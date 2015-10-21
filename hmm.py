@@ -10,7 +10,7 @@ from joblib import Parallel, delayed
 import multiprocessing
 
 universal_pos_tags = ['VERB', 'NOUN', 'PRON', 'ADJ', 'ADV', 'ADP', 'CONJ', 'DET', 'NUM', 'PRT', 'X', '.', 'START']
-
+universal_pos_closed = numpy.array([False, False, True, False, False, True, True, True, False, True, False, True, True], dtype=bool)
 
 def fill_forward_lattice(sentence_int, trans_probs, emission_probs, start_token):
     n = trans_probs.shape[0]
@@ -112,15 +112,29 @@ def viterbi(sentence_int, trans_probs, emission_probs, start_token):
     seq_rev.reverse()
     return seq_rev, math.log(end_probs.max()) + probability_factor
 
-def get_shared_model(languages, pos_tags):
-    start_token = pos_tags.index('START')
+def get_shared_model(languages, univeral_pos_tags, do_lang_specific):
     transitions = []
     tag_distributions = []
+    universal_tag_maps = []
     for l, language in enumerate(languages):
-        text_sentences = load_and_save.read_sentences_from_file('pos_data/'+language+'.pos')
+        filename = 'pos_data/'+language+ ('.spec.pos' if do_lang_specific else '.pos')
+        text_sentences = load_and_save.read_sentences_from_file(filename)
 
-        sentences, words, sentences_pos, pos = load_and_save.integer_sentences(text_sentences, pos=pos_tags, max_words=1000)
-        n_pos = len(pos_tags)
+        sentences, words, sentences_pos, pos = load_and_save.integer_sentences(text_sentences, pos=None if do_lang_specific else univeral_pos_tags, max_words=1000)
+
+        if do_lang_specific:
+            start_token = len(pos)
+            pos.append('START-') #language specific tags must have a universal and a dash
+
+            pos_map = [0 for _ in xrange(len(pos))]
+            for i, p in enumerate(pos):
+                universal = p[:p.index('-')]
+                pos_map[i] = universal_pos_tags.index(universal)
+        else:
+            start_token = universal_pos_tags.index('START')
+            pos_map = range(len(pos))
+
+        n_pos = len(pos)
 
         trans_counts = numpy.zeros((n_pos, n_pos))
         word_pos = numpy.zeros((n_pos, 1000))
@@ -144,7 +158,9 @@ def get_shared_model(languages, pos_tags):
         tag_probs = tag_counts / tag_counts.sum()
         tag_distributions.append(tag_probs)
 
-    return transitions, tag_distributions
+        universal_tag_maps.append(pos_map)
+
+    return transitions, tag_distributions, universal_tag_maps
 
 def probs_from_weights(weights):
     # TODO: do we want to offset weights before exp for numerical reasons?
@@ -154,7 +170,7 @@ def probs_from_weights(weights):
 
 def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_trans_probs, source_tag_probs,
                       update_transitions, direct_gradient,
-                      l2_weight_regularization, l1_unnorm_regularization, l1_regularization_by_tag):
+                      l2_weight_regularization, l0_coeff):
 
     norm_l = .1
     log_source_tag_probs = numpy.log(source_tag_probs + 1e-8)
@@ -187,12 +203,6 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
 
         result += (weights * weights).sum() * l2_weight_regularization
 
-        result += numpy.exp(weights * norm_l).sum() * l1_unnorm_regularization
-
-        exponentials = numpy.exp(weights)
-        sum_exp_over_tags = exponentials.sum(axis=0)
-        result -= (log_source_tag_probs[:, numpy.newaxis] * (exponentials / sum_exp_over_tags[numpy.newaxis, :])).sum() * l1_regularization_by_tag
-
         return result
 
     def d_loss_em(weights):
@@ -202,15 +212,6 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
         result = (p * pos_counts[:, numpy.newaxis]) - em_counts
 
         result += 2 * l2_weight_regularization * weights
-
-        result += numpy.exp(weights * norm_l) * (l1_unnorm_regularization * norm_l)
-
-        exponentials = numpy.exp(weights)
-        sum_exp_over_tags = exponentials.sum(axis=0)
-        exp_times_log_tag = log_source_tag_probs[:, numpy.newaxis] * exponentials
-        term1 = exp_times_log_tag * sum_exp_over_tags[numpy.newaxis, :]
-        term3 = exp_times_log_tag.sum(axis=0)[numpy.newaxis, :] * exponentials
-        result -= (term1 - term3) / (sum_exp_over_tags * sum_exp_over_tags)[numpy.newaxis, :] * l1_regularization_by_tag
 
         return result.ravel()
 
@@ -237,6 +238,11 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
     emission_weights = result.x.reshape(em_counts.shape)
     em_log_prob = result.fun
 
+    # sketchy way of trying to enforce l0
+    sorted_weights = numpy.sort(emission_weights, axis=1)
+    cutoffs = sorted_weights[:,950]
+    emission_weights[universal_pos_closed, :] -= (emission_weights[universal_pos_closed,:] < cutoffs[universal_pos_closed][:,numpy.newaxis]) * l0_coeff
+
     emission_probs = probs_from_weights(emission_weights)
 
     description_string =  'log probability %s (%s %s)' % (em_log_prob + trans_log_prob, em_log_prob, trans_log_prob)
@@ -255,7 +261,8 @@ def model_from_counts(transition_counts, emission_counts):
 
 
 default_args = {'reg_coeff': 0, 'iterations': 20, 'init_noise_level': 0, 'repeat': 1, 'update_transitions': 'False',
-                'l1_exp_coeff': 0, 'l1_tag_coeff': 0, 'direct_gradient': 'False'}
+                'l0_coeff': 0, 'direct_gradient': 'False', 'do_lang_specific': 'False',
+                'prototypes': 'False'}
 
 args = default_args.copy()
 for arg in sys.argv[1:]:
@@ -265,12 +272,12 @@ for arg in sys.argv[1:]:
     args[key] = val
 
 (iterations, initialization_noise_level, repeat, out_file, source, target, update_transitions,
- l2_weight_regulariztion_coeff, l1_exp_regularization_coeff, l1_tag_regularization_coeff,
- direct_gradient) = \
+ l2_weight_regulariztion_coeff, l0_coefficient,
+ direct_gradient, do_language_specific_tags, use_prototypes) = \
 (int(args['iterations']), float(args['init_noise_level']), int(args['repeat']),
                args['out_file'] if 'out_file' in args else None, args['sources'].split(',') if 'sources' in args else None, args['target'],
-               args['update_transitions'] == 'True', float(args['reg_coeff']), float(args['l1_exp_coeff']), float(args['l1_tag_coeff']),
-               args['direct_gradient'] == 'True')
+               args['update_transitions'] == 'True', float(args['reg_coeff']), float(args['l0_coeff']),
+               args['direct_gradient'] == 'True', args['do_lang_specific'] == 'True', args['prototypes'] == 'True')
 
 print 'iterations', iterations
 print 'initalization noise', initialization_noise_level
@@ -278,17 +285,19 @@ print 'repeats', repeat
 print 'output file', out_file
 print 'update transitions', update_transitions
 print 'l2 weight regularization', l2_weight_regulariztion_coeff
-print 'l1 exp regularization', l1_exp_regularization_coeff
-print 'l1 tag normalized regularization', l1_tag_regularization_coeff
+print 'l0 coefficient', l0_coefficient
 print 'direct gradient', direct_gradient
+print 'language specific tags', do_language_specific_tags
 
-pos_tags = universal_pos_tags
+
+prototypes = {'the':'DET', 'are':'VERB', 'said':'VERB', 'and':'CONJ'}
+
+print 'prototypes', use_prototypes, prototypes
 
 language = target
 print 'to', language
 text_sentences = load_and_save.read_sentences_from_file('pos_data/'+language+'.pos')
 sentences, words, sentences_pos, pos = load_and_save.integer_sentences(text_sentences, pos=universal_pos_tags, max_words=1000)
-n_pos = len(pos_tags)
 n_words = len(words)
 
 WALS_map = load_and_save.load_WALS_map('pos_data/WALS_map')
@@ -296,17 +305,59 @@ annotated_languages = source if source is not None else [l for l in WALS_map if 
 print 'from', annotated_languages
 num_shared_langs = len(annotated_languages)
 
-other_langs_trans_dists, other_langs_tag_dists = get_shared_model(annotated_languages, pos_tags)
+other_langs_trans_dists, other_langs_tag_dists, universal_pos_maps = get_shared_model(annotated_languages, universal_pos_tags, do_language_specific_tags)
 
 print "finished loading source models"
 
-def run(initial_lg_transition, initial_lg_emission, source_transition, source_tag_distribution, name):
+def test(name, trans_probs, em_probs, start_token, universal_pos_map):
+    correct = 0
+    total = 0
+    prototype_correct = 0
+    prototype_total = 0
+    iteration_result = []
+    viterbi_log_prob = 0
+    word_pos_counts = numpy.zeros((len(words), len(universal_pos_tags)))
+    text_result_iter = []
+    for sentence, sent_pos in zip(sentences, sentences_pos):
+        pred_pos, pred_prob_log = viterbi(sentence, trans_probs, em_probs, start_token)
+        pred_pos = [universal_pos_map[p] for p in pred_pos]
+        viterbi_log_prob += pred_prob_log
+        iteration_result.append(pred_pos)
+        text_result_iter.append([(words[w], universal_pos_tags[p]) for w, p in zip(sentence, pred_pos)])
+
+        for w, p in zip(sentence, pred_pos):
+            if words[w] in prototypes:
+                prototype_total += 1
+                if universal_pos_tags[p] == prototypes[words[w]]:
+                    prototype_correct += 1
+        # print [(words[w], pos[p]) for w, p in zip(sentence, pred_pos)]
+        # print pred_prob_log
+        for pred, gold, word in zip(pred_pos, sent_pos, sentence):
+            total += 1
+            if pred == gold:
+                correct += 1
+            word_pos_counts[word, pred] += 1
+    print name, correct / float(total)
+    print name, 'viterbi log prob:', viterbi_log_prob
+
+    print name, 'prototype accuracy', prototype_correct / float(prototype_total)
+
+    word_pos_indicator = (word_pos_counts > 0)
+    print name, 'average number of pos per word', word_pos_indicator.sum() / float(n_words)
+    word_pos_counts /= word_pos_counts.sum(axis=1)[:, numpy.newaxis]
+    print name, 'word counts', universal_pos_tags, word_pos_counts.sum(axis=0)
+
+    return iteration_result, text_result_iter
+
+def run(initial_lg_transition, initial_lg_emission, source_transition, source_tag_distribution, universal_pos_map, name):
     prev_trans_weights = initial_lg_transition
     prev_em_weights = initial_lg_emission
     trans_probs = probs_from_weights(initial_lg_transition)
     em_probs = probs_from_weights(initial_lg_emission)
 
-    start_token = pos_tags.index('START')
+    n_pos = initial_lg_transition.shape[0]
+
+    start_token = universal_pos_map.index(universal_pos_tags.index('START'))
 
     for iter in xrange(iterations):
         trans_counts = numpy.zeros((n_pos, n_pos))
@@ -322,35 +373,16 @@ def run(initial_lg_transition, initial_lg_emission, source_transition, source_ta
         trans_probs, em_probs, prev_trans_weights, prev_em_weights, result_description = \
             optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_transition, source_tag_distribution,
                               update_transitions, direct_gradient,
-                              l2_weight_regulariztion_coeff, l1_exp_regularization_coeff, l1_tag_regularization_coeff)
+                              l2_weight_regulariztion_coeff, l0_coefficient)
         print name, "iteration:", iter, result_description
 
-    correct = 0
-    total = 0
-    iteration_result = []
-    viterbi_log_prob = 0
-    word_pos_counts = numpy.zeros((len(words), n_pos))
-    text_result_iter = []
-    for sentence, sent_pos in zip(sentences, sentences_pos):
-        pred_pos, pred_prob_log = viterbi(sentence, trans_probs, em_probs, start_token)
-        viterbi_log_prob += pred_prob_log
-        iteration_result.append(pred_pos)
-        text_result_iter.append([(words[w], pos_tags[p]) for w, p in zip(sentence, pred_pos)])
-        # print [(words[w], pos[p]) for w, p in zip(sentence, pred_pos)]
-        # print pred_prob_log
-        for pred, gold, word in zip(pred_pos, sent_pos, sentence):
-            total += 1
-            if pred == gold:
-                correct += 1
-            word_pos_counts[word, pred] += 1
-    print name, correct / float(total)
-    print name, 'viterbi log prob:', viterbi_log_prob
+        if iter % 10 == 9:
+            test(name, trans_probs, em_probs, start_token, universal_pos_map)
 
-    word_pos_indicator = (word_pos_counts > 0)
-    print 'average number of pos per word', word_pos_indicator.sum() / float(n_words)
-    word_pos_counts /= word_pos_counts.sum(axis=1)[:, numpy.newaxis]
-    print 'word counts', universal_pos_tags, word_pos_counts.sum(axis=0)
 
+    iteration_result, text_result_iter = test(name, trans_probs, em_probs, start_token, universal_pos_map)
+
+    print name, 'transition distance moved', numpy.abs(source_transition - trans_probs).sum()
 
     if out_file is not None:
         load_and_save.write_sentences_to_file(text_result_iter, out_file + '-' + name)
@@ -359,7 +391,8 @@ def run(initial_lg_transition, initial_lg_emission, source_transition, source_ta
 
 initializations = []
 for repeat_number in xrange(repeat):
-    for trans_dist, tag_dist, language_name in zip(other_langs_trans_dists, other_langs_tag_dists, annotated_languages):
+    for trans_dist, tag_dist, pos_map, language_name in zip(other_langs_trans_dists, other_langs_tag_dists, universal_pos_maps, annotated_languages):
+        n_pos = trans_dist.shape[0]
         initial_lg_trans = numpy.log(trans_dist)
         init_em = numpy.ones((n_pos, n_words))
 
@@ -372,12 +405,19 @@ for repeat_number in xrange(repeat):
             if word_is_punc:
                 detected_punc.append(words[w])
             for p in xrange(n_pos):
-                pos_is_punc = (pos_tags[p] == '.')
+                pos_is_punc = (universal_pos_tags[pos_map[p]] == '.')
 
                 if pos_is_punc and not word_is_punc:
                     init_em[p, w] = .01
                 elif word_is_punc and not pos_is_punc:
                     init_em[p, w] = .01
+
+            if use_prototypes and words[w] in prototypes:
+                proto_pos = universal_pos_tags.index(prototypes[words[w]])
+                for p in xrange(n_pos):
+                    if pos_map[p] != proto_pos:
+                        init_em[p, w] = .01
+
         print 'detected punctuation', detected_punc
 
         init_em /= init_em.sum(axis=1)[:, numpy.newaxis]
@@ -389,21 +429,27 @@ for repeat_number in xrange(repeat):
             initial_lg_trans += numpy.random.normal(scale=initialization_noise_level, size=initial_lg_trans.shape)
             initial_lg_em += numpy.random.normal(scale=initialization_noise_level, size=initial_lg_em.shape)
 
-        initializations.append((initial_lg_trans, initial_lg_em, trans_dist, tag_dist, name))
+        initializations.append((initial_lg_trans, initial_lg_em, trans_dist, tag_dist, pos_map, name))
 
 num_cores = min(len(initializations), max(multiprocessing.cpu_count() / 2, 1))
-results = Parallel(n_jobs=num_cores)(delayed(run)(ilt, ile, tnsd, tgd, n) for ilt, ile, tnsd, tgd, n in initializations)
+results = Parallel(n_jobs=num_cores)(delayed(run)(ilt, ile, tnsd, tgd, pm, n) for ilt, ile, tnsd, tgd, pm, n in initializations)
 # results = [run(ilt, ile, td, n) for pt, pe, n in initializations]
 
 # vote on final output over different initializations
+n_pos = len(universal_pos_tags)
+universal_start_token = universal_pos_tags.index('START')
 pred_sent_pos = []
 out_text_sents = []
 total = 0
 correct = 0
 confusion_matrix = numpy.zeros((n_pos, n_pos))
+
+trans_counts = numpy.zeros((n_pos, n_pos))
+em_counts = numpy.zeros((n_pos, n_words))
 for s, sent_pos in enumerate(sentences_pos):
     pred_for_sent = []
     out_text_sent = []
+    prev_pos = universal_start_token
     for w, pos in enumerate(sent_pos):
         votes = [results[i][s][w] for i in xrange(len(results))]
         pred = int(scipy.stats.mode(votes)[0])
@@ -413,7 +459,14 @@ for s, sent_pos in enumerate(sentences_pos):
             correct += 1
         total += 1
 
-        out_text_sent.append((text_sentences[s][w][0], pos_tags[pred]))
+        # do counts
+        trans_counts[prev_pos, pred] += 1
+        em_counts[pred, sentences[s][w]] += 1
+
+        out_text_sent.append((text_sentences[s][w][0], universal_pos_tags[pred]))
+
+    trans_counts[prev_pos, universal_start_token] += 1
+
     pred_sent_pos.append(pred_for_sent)
     out_text_sents.append(out_text_sent)
 print 'score', correct / float(total)
@@ -421,3 +474,11 @@ print 'score', correct / float(total)
 print 'many to one', confusion_matrix.max(axis=1).sum() / float(confusion_matrix.sum())
 if out_file is not None:
     load_and_save.write_sentences_to_file(out_text_sents, out_file)
+
+'''
+trans_counts += 1e-8
+em_counts += 1e-8
+voted_trans_probs = trans_counts / trans_counts.sum(axis=1)[:, numpy.newaxis]
+voted_em_probs = em_counts / em_counts.sum(axis=1)[:, numpy.newaxis]
+run(numpy.log(voted_trans_probs), numpy.log(voted_em_probs), voted_trans_probs, numpy.zeros(n_pos), range(n_pos), 'final')
+'''
