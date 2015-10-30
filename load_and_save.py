@@ -117,7 +117,7 @@ def read_hindi_corpus(dir):
     if nltk is None:
         return
 
-    pos_map = read_pos_map('indian.uni.map')
+    pos_map = read_pos_map('paths/indian.uni.map')
     for f in nltk.corpus.indian.fileids():
         print '\n', f
         sentences = nltk.corpus.indian.tagged_sents(f, simplify_tags=False)
@@ -167,17 +167,20 @@ def load_pos_sequence_file(filename):
     return result
 
 
-def integer_sentences(sentences, pos=None, max_words=None):
+def integer_sentences(sentences, pos=None, max_words=None, words=None):
     sentences_flat = [i for s in sentences for i in s]
     word_counts = Counter(w for w, _ in sentences_flat)
     pos_counts = Counter(p for _, p in sentences_flat)
-    words = word_counts.keys()
-    words.sort(key=lambda x: word_counts[x], reverse=True)
-    unk_id = -1
-    if max_words is not None and len(words) > max_words:
-        words = words[:max_words-1]
-        unk_id = len(words)
-        words.append('<UNK>')
+    if words is None:
+        words = word_counts.keys()
+        words.sort(key=lambda x: word_counts[x], reverse=True)
+        unk_id = -1
+        if max_words is not None and len(words) > max_words:
+            words = words[:max_words-1]
+            unk_id = len(words)
+            words.append('<UNK>')
+    else:
+        unk_id = words.index('<UNK>')
     if pos is None:
         pos = pos_counts.keys()
     word_ids = {w:i for i, w in enumerate(words)}
@@ -198,6 +201,8 @@ if __name__ == "__main__":
     for conll_lang in ['basque07', 'catalan07', 'greek07', 'hungarian07', 'italian07', 'arabic', 'dutch', 'spanish', 'german', 'czech', 'swedish', 'chinese', 'danish', 'bulgarian', 'english07', 'japanese', 'portuguese', 'turkish', 'slovene']:
         s = read_conll_sentences('paths/'+conll_lang+'.train', 'paths/'+conll_lang+'.uni.map')
         write_sentences_to_file(s, 'pos_data/conll-%s.pos' % conll_lang)
+        s = read_conll_sentences('paths/'+conll_lang+'.test', 'paths/'+conll_lang+'.uni.map')
+        write_sentences_to_file(s, 'pos_data/conll-%s-test.pos' % conll_lang)
         s = read_conll_sentences('paths/'+conll_lang+'.train', 'paths/'+conll_lang+'.uni.map', True)
         write_sentences_to_file(s, 'pos_data/conll-%s.spec.pos' % conll_lang)
     read_hindi_corpus('pos_data')
