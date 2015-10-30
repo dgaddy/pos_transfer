@@ -5,6 +5,8 @@ import math
 import sys
 import scipy.stats
 import load_and_save
+import prototypes_helper
+import word_vect_loader
 
 from joblib import Parallel, delayed
 import multiprocessing
@@ -162,19 +164,49 @@ def get_shared_model(languages, univeral_pos_tags, do_lang_specific):
 
     return transitions, tag_distributions, universal_tag_maps
 
-def probs_from_weights(weights):
+class FeatureMap:
+    def __init__(self):
+        self.feats = []
+        self.map = {}
+
+    def get_id(self, feature):
+        if feature in self.map:
+            return self.map[feature]
+        else:
+            id = len(self.feats)
+            self.map[feature] = id
+            self.feats.append(feature)
+            return id
+
+def make_emission_features(pos, words, prototypes):
+    n_pos = len(pos)
+    n_words = len(words)
+    fm = FeatureMap()
+    feature_matrix = numpy.empty((n_pos, n_words), dtype=object)
+    for i in xrange(n_pos):
+        for j in xrange(n_words):
+            word = words[j]
+            feats = ['emit %s %s' % (pos[i], word), 'emit_suf %s %s' % (pos[i], word[-3:])]
+            if prototypes is not None:
+                for p in prototypes[j]:
+                    feats.append('prototype %s %s' % (pos[i], p))
+            feature_matrix[i, j] = [fm.get_id(f) for f in feats]
+
+    return feature_matrix, fm
+
+def probs_from_weights(weights, mask=None):
     # TODO: do we want to offset weights before exp for numerical reasons?
 
     exp_weights = numpy.exp(weights)
+    if mask is not None:
+        exp_weights *= mask
     return exp_weights / exp_weights.sum(axis=1)[:, numpy.newaxis]
 
-def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_trans_probs, source_tag_probs,
-                      update_transitions, direct_gradient,
-                      l2_weight_regularization, l0_coeff):
+def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_trans_probs,
+                      update_transitions, direct_gradient, emission_features, n_em_feats,
+                      l2_weight_regularization, emission_mask):
 
-    norm_l = .1
-    log_source_tag_probs = numpy.log(source_tag_probs + 1e-8)
-
+    # for transition, there is just one feature per transition, so we can use the normalized exp of the weights
     def loss_trans(weights):
         weights = weights.reshape(trans_counts.shape)  # because optimize flattens them
         p = probs_from_weights(weights)
@@ -195,9 +227,18 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
 
         return result.ravel()
 
+    # for the emission, weights are for features which are used to create the emission_weight_matrix
+    # the emission_weight_matrix can be exponentiated and normalized to get the distribution
+    def em_matrix_from_weights(weights):
+        matrix = numpy.zeros(em_counts.shape)
+        for i in xrange(emission_features.shape[0]):
+            for j in xrange(emission_features.shape[1]):
+                matrix[i, j] = sum(weights[f] for f in emission_features[i, j])
+        return matrix
+
     def loss_em(weights):
-        weights = weights.reshape(em_counts.shape)
-        p = probs_from_weights(weights)
+        emission_weight_matrix = em_matrix_from_weights(weights)
+        p = probs_from_weights(emission_weight_matrix)
         log_p = numpy.log(p)
         result = -((em_counts * log_p).sum())
 
@@ -206,12 +247,20 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
         return result
 
     def d_loss_em(weights):
-        weights = weights.reshape(em_counts.shape)
-        p = probs_from_weights(weights)
+        emission_weight_matrix = em_matrix_from_weights(weights)
+        p = probs_from_weights(emission_weight_matrix)
         pos_counts = em_counts.sum(axis=1)
-        result = (p * pos_counts[:, numpy.newaxis]) - em_counts
+        dL_dmatrix = (p * pos_counts[:, numpy.newaxis]) - em_counts
 
-        result += 2 * l2_weight_regularization * weights
+        # regularization
+        result = 2 * l2_weight_regularization * weights
+
+        # add feature derivatives based on dL_dmatrix
+        for i in xrange(emission_features.shape[0]):
+            for j in xrange(emission_features.shape[1]):
+                dl_dm = dL_dmatrix[i, j]
+                for f in emission_features[i, j]:
+                    result[f] += dl_dm
 
         return result.ravel()
 
@@ -232,18 +281,13 @@ def optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weigh
         trans_log_prob = -((trans_counts * log_p).sum())
 
     if prev_em_weights is None:
-        prev_em_weights = numpy.zeros(em_counts.shape)
+        prev_em_weights = numpy.zeros(n_em_feats)
     result = scipy.optimize.minimize(loss_em, prev_em_weights, method='L-BFGS-B', jac=d_loss_em,
                                      options=({'maxiter':1} if direct_gradient else {}))
-    emission_weights = result.x.reshape(em_counts.shape)
+    emission_weights = result.x
     em_log_prob = result.fun
 
-    # sketchy way of trying to enforce l0
-    sorted_weights = numpy.sort(emission_weights, axis=1)
-    cutoffs = sorted_weights[:,950]
-    emission_weights[universal_pos_closed, :] -= (emission_weights[universal_pos_closed,:] < cutoffs[universal_pos_closed][:,numpy.newaxis]) * l0_coeff
-
-    emission_probs = probs_from_weights(emission_weights)
+    emission_probs = probs_from_weights(em_matrix_from_weights(emission_weights), emission_mask)
 
     description_string =  'log probability %s (%s %s)' % (em_log_prob + trans_log_prob, em_log_prob, trans_log_prob)
 
@@ -262,7 +306,7 @@ def model_from_counts(transition_counts, emission_counts):
 
 default_args = {'reg_coeff': 0, 'iterations': 20, 'init_noise_level': 0, 'repeat': 1, 'update_transitions': 'False',
                 'l0_coeff': 0, 'direct_gradient': 'False', 'do_lang_specific': 'False',
-                'prototypes': 'False'}
+                'prototypes': 'False', 'random_init': 'False'}
 
 args = default_args.copy()
 for arg in sys.argv[1:]:
@@ -272,12 +316,13 @@ for arg in sys.argv[1:]:
     args[key] = val
 
 (iterations, initialization_noise_level, repeat, out_file, source, target, update_transitions,
- l2_weight_regulariztion_coeff, l0_coefficient,
- direct_gradient, do_language_specific_tags, use_prototypes) = \
+ l2_weight_regulariztion_coeff,
+ direct_gradient, do_language_specific_tags, use_prototypes, random_init) = \
 (int(args['iterations']), float(args['init_noise_level']), int(args['repeat']),
                args['out_file'] if 'out_file' in args else None, args['sources'].split(',') if 'sources' in args else None, args['target'],
-               args['update_transitions'] == 'True', float(args['reg_coeff']), float(args['l0_coeff']),
-               args['direct_gradient'] == 'True', args['do_lang_specific'] == 'True', args['prototypes'] == 'True')
+               args['update_transitions'] == 'True', float(args['reg_coeff']),
+               args['direct_gradient'] == 'True', args['do_lang_specific'] == 'True', args['prototypes'] == 'True',
+               args['random_init'] == 'True')
 
 print 'iterations', iterations
 print 'initalization noise', initialization_noise_level
@@ -285,12 +330,27 @@ print 'repeats', repeat
 print 'output file', out_file
 print 'update transitions', update_transitions
 print 'l2 weight regularization', l2_weight_regulariztion_coeff
-print 'l0 coefficient', l0_coefficient
 print 'direct gradient', direct_gradient
 print 'language specific tags', do_language_specific_tags
 
-
-prototypes = {'the':'DET', 'are':'VERB', 'said':'VERB', 'and':'CONJ'}
+# the prototypes used by Haghighi and Klein, with capitalized words and punctuation removed (we lowercase everything)
+prototypes = {'%':'NOUN', 'company':'NOUN', 'year':'NOUN', 'new':'ADJ', 'other':'ADJ', 'last':'ADJ',
+              'will':'VERB', 'would':'VERB', 'could':'VERB', 'are':'VERB', "'re":'VERB', "'ve":'VERB',
+              "n't":'ADV', 'also':'ADV', 'not':'ADV', 'when':'ADV', 'how':'ADV', 'where':'ADV',
+              'of':'ADP', 'in':'ADP', 'for':'ADP', 'c':'X', 'b':'X', 'f':'X',
+              'million':'NUM', 'billion':'NUM', 'two':'NUM', 'to':'PRT', 'na':'PRT',
+              'been':'VERB', 'based':'VERB', 'compared':'VERB', 'earlier':'ADV', 'duller':'ADV',
+              'is':'VERB', 'has':'VERB', 'says':'VERB', 'least':'ADJ', 'largest':'ADJ', 'biggest':'ADJ',
+              'mr.':'NOUN', 'u.s.':'NOUN', 'corp.':'NOUN', "'s":'PRT',
+              'its':'PRON', 'their':'PRON', 'his':'PRON', 'quite':'DET',
+              'which':'DET', 'whatever':'DET', 'there':'DET',
+              'years':'NOUN', 'shares':'NOUN', 'companies':'NOUN', 'including':'VERB', 'being':'VERB', 'according':'VERB',
+              'the':'DET', 'a':'DET', 'whose':'PRON', 'bono':'X', 'del':'X', 'kangi':'X',
+              'up':'PRT', 'on':'PRT', 'said':'VERB', 'was':'VERB', 'had':'VERB',
+              'philippines':'NOUN', 'angels':'NOUN', 'rights':'NOUN', 'be':'VERB', 'take':'VERB', 'provide':'VERB',
+              'worst':'ADV', 'and':'CONJ', 'or':'CONJ', 'but':'CONJ',
+              'smaller':'ADJ', 'greater':'ADJ', 'larger':'ADJ', 'who':'PRON', 'what':'PRON',
+              'it':'PRON', 'he':'PRON', 'they':'PRON', 'oh':'X', 'well':'X', 'yeah':'X'}
 
 print 'prototypes', use_prototypes, prototypes
 
@@ -300,8 +360,28 @@ text_sentences = load_and_save.read_sentences_from_file('pos_data/'+language+'.p
 sentences, words, sentences_pos, pos = load_and_save.integer_sentences(text_sentences, pos=universal_pos_tags, max_words=1000)
 n_words = len(words)
 
+prototype_ids = [words.index(p) for p in prototypes if p in words]
+for p in prototypes:
+    if p in words:
+        prototype_ids.append(words.index(p))
+    else:
+        print 'warning: prototype not in words', p
+
+#word_vects = prototypes_helper.get_word_context_vectors(sentences, n_words)
+word_vect_map, word_vect_size = word_vect_loader.load('context_svd_output.vec')
+word_vect_matrix = numpy.zeros((n_words, word_vect_size))
+for w in xrange(n_words):
+    if words[w] in word_vect_map:
+        v = word_vect_map[words[w]]
+        word_vect_matrix[w, :] = v / math.sqrt((v*v).sum())
+prototypes_for_words = prototypes_helper.get_prototypes(words, word_vect_matrix, prototype_ids)
+
+emission_feature_matrix, emission_feature_map = make_emission_features(pos, words, prototypes_for_words if use_prototypes else None)
+
 WALS_map = load_and_save.load_WALS_map('pos_data/WALS_map')
 annotated_languages = source if source is not None else [l for l in WALS_map if l != target]
+if len(annotated_languages) == 1 and annotated_languages[0] == '':
+    annotated_languages = []
 print 'from', annotated_languages
 num_shared_langs = len(annotated_languages)
 
@@ -349,11 +429,11 @@ def test(name, trans_probs, em_probs, start_token, universal_pos_map):
 
     return iteration_result, text_result_iter
 
-def run(initial_lg_transition, initial_lg_emission, source_transition, source_tag_distribution, universal_pos_map, name):
+def run(initial_lg_transition, initial_lg_emission, source_transition, emission_mask, universal_pos_map, name):
     prev_trans_weights = initial_lg_transition
-    prev_em_weights = initial_lg_emission
+    prev_em_weights = None
     trans_probs = probs_from_weights(initial_lg_transition)
-    em_probs = probs_from_weights(initial_lg_emission)
+    em_probs = probs_from_weights(initial_lg_emission, emission_mask)
 
     n_pos = initial_lg_transition.shape[0]
 
@@ -371,9 +451,9 @@ def run(initial_lg_transition, initial_lg_emission, source_transition, source_ta
         #trans_probs, em_probs = model_from_counts(trans_counts, em_counts, n_pos)
 
         trans_probs, em_probs, prev_trans_weights, prev_em_weights, result_description = \
-            optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_transition, source_tag_distribution,
-                              update_transitions, direct_gradient,
-                              l2_weight_regulariztion_coeff, l0_coefficient)
+            optimize_features(trans_counts, em_counts, prev_trans_weights, prev_em_weights, source_transition,
+                              update_transitions, direct_gradient, emission_feature_matrix, len(emission_feature_map.feats),
+                              l2_weight_regulariztion_coeff, emission_mask)
         print name, "iteration:", iter, result_description
 
         if iter % 10 == 9:
@@ -389,12 +469,23 @@ def run(initial_lg_transition, initial_lg_emission, source_transition, source_ta
 
     return iteration_result
 
+if random_init:
+    n_pos = len(universal_pos_tags)
+    td = numpy.ones((n_pos, n_pos))
+    td /= n_pos
+    other_langs_trans_dists.append(td)
+    other_langs_tag_dists.append(None)
+    universal_pos_maps.append(range(n_pos))
+    annotated_languages.append('random')
+
 initializations = []
 for repeat_number in xrange(repeat):
     for trans_dist, tag_dist, pos_map, language_name in zip(other_langs_trans_dists, other_langs_tag_dists, universal_pos_maps, annotated_languages):
         n_pos = trans_dist.shape[0]
         initial_lg_trans = numpy.log(trans_dist)
         init_em = numpy.ones((n_pos, n_words))
+
+        emission_mask = numpy.ones((n_pos, n_words))
 
         # set punctuation
         def is_punc(s):
@@ -409,14 +500,17 @@ for repeat_number in xrange(repeat):
 
                 if pos_is_punc and not word_is_punc:
                     init_em[p, w] = .01
+                    emission_mask[p,w] = 1e-12
                 elif word_is_punc and not pos_is_punc:
                     init_em[p, w] = .01
+                    emission_mask[p,w] = 1e-12
 
             if use_prototypes and words[w] in prototypes:
                 proto_pos = universal_pos_tags.index(prototypes[words[w]])
                 for p in xrange(n_pos):
                     if pos_map[p] != proto_pos:
-                        init_em[p, w] = .01
+                        init_em[p, w] = .0001
+                        emission_mask[p,w] = 1e-12
 
         print 'detected punctuation', detected_punc
 
@@ -429,11 +523,11 @@ for repeat_number in xrange(repeat):
             initial_lg_trans += numpy.random.normal(scale=initialization_noise_level, size=initial_lg_trans.shape)
             initial_lg_em += numpy.random.normal(scale=initialization_noise_level, size=initial_lg_em.shape)
 
-        initializations.append((initial_lg_trans, initial_lg_em, trans_dist, tag_dist, pos_map, name))
+        initializations.append((initial_lg_trans, initial_lg_em, trans_dist, emission_mask, pos_map, name))
 
 num_cores = min(len(initializations), max(multiprocessing.cpu_count() / 2, 1))
-results = Parallel(n_jobs=num_cores)(delayed(run)(ilt, ile, tnsd, tgd, pm, n) for ilt, ile, tnsd, tgd, pm, n in initializations)
-# results = [run(ilt, ile, td, n) for pt, pe, n in initializations]
+results = Parallel(n_jobs=num_cores)(delayed(run)(ilt, ile, tnsd, mask, pm, n) for ilt, ile, tnsd, mask, pm, n in initializations)
+#results = [run(ilt, ile, tnsd, tgd, pm, n) for ilt, ile, tnsd, tgd, pm, n in initializations]
 
 # vote on final output over different initializations
 n_pos = len(universal_pos_tags)
